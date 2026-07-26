@@ -7,7 +7,7 @@ plugins {
 android {
     namespace = "com.example.autonap"
     compileSdk = 36 // Hardcoded for stability
-    ndkVersion = flutter.ndkVersion
+    ndkVersion = "26.1.10909125"
 
     compileOptions {
         // This is the line the error is looking for
@@ -25,7 +25,7 @@ android {
         targetSdk = 34 
         // minSdk 21 is required for the notification library
         minSdk = flutter.minSdkVersion 
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 34
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         
