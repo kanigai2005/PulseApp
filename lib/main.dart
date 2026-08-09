@@ -291,6 +291,9 @@ class _DashboardViewState extends State<DashboardView>
     _pulseAnimController.dispose();
     _napCountdownTimer?.cancel();
     _demoTimer?.cancel();
+    _scanSubscription?.cancel();
+    _connectionStateSubscription?.cancel();
+    _connectedDevice?.disconnect();
     super.dispose();
   }
 
@@ -305,57 +308,176 @@ class _DashboardViewState extends State<DashboardView>
   }
 
   // BLE Scan matching ESP32 firmware
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
+  BluetoothDevice? _connectedDevice;
+
   void _startBleScan() {
     if (globalDemoMode.value) return;
 
+    print("Starting BLE Scan for '$kBleServiceName'...");
+    globalAutoStatus.value = "Scanning for ESP32 Sensor...";
+
+    // Cancel any previous scan subscription to avoid duplicates
+    _scanSubscription?.cancel();
+
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 15));
-    FlutterBluePlus.scanResults.listen((results) {
+
+    _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
       for (ScanResult r in results) {
-        if (r.device.platformName == kBleServiceName) {
+        final advName = r.advertisementData.advName;
+        final platName = r.device.platformName;
+        print("Scanned device — advName: '$advName', platformName: '$platName'");
+
+        if (advName == kBleServiceName || platName == kBleServiceName) {
+          print("Found target device! Stopping scan and connecting...");
+          globalAutoStatus.value = "Found ESP32! Connecting...";
           FlutterBluePlus.stopScan();
-          _connectToBleDevice(r.device);
-          break;
+          _scanSubscription?.cancel();
+          _connectToDevice(r.device);
+          return;
         }
+      }
+    });
+
+    // If scan times out without finding the device, retry
+    Future.delayed(const Duration(seconds: 16), () {
+      if (!globalIsBleConnected.value && !globalDemoMode.value) {
+        print("Scan timed out. Retrying...");
+        globalAutoStatus.value = "ESP32 not found. Retrying scan...";
+        _startBleScan();
       }
     });
   }
 
-  void _connectToBleDevice(BluetoothDevice device) async {
+  void _connectToDevice(BluetoothDevice device) async {
     try {
-      await device.connect(autoConnect: false);
-      globalIsBleConnected.value = true;
-      globalAutoStatus.value =
-          "Connected to AutoNap_Sensor. Calibrating pulse...";
+      // CRITICAL FIX: If already connected (e.g. from hot-reload),
+      // disconnect first so ESP32's onConnect callback fires fresh.
+      // This ensures ESP32 sets deviceConnected = true on its side.
+      if ((await device.connectionState.first) ==
+          BluetoothConnectionState.connected) {
+        print("Device already connected — disconnecting first for clean reconnect...");
+        globalAutoStatus.value = "Reconnecting to ESP32...";
+        await device.disconnect();
+        await Future.delayed(const Duration(seconds: 1));
+      }
 
+      print("Connecting to ESP32...");
+      await device.connect(autoConnect: false).timeout(const Duration(seconds: 10));
+
+      // Listen for connection state changes (auto-reconnect on drop)
+      _connectionStateSubscription?.cancel();
+      _connectionStateSubscription = device.connectionState.listen((state) {
+        print("BLE Connection State: $state");
+        if (state == BluetoothConnectionState.disconnected) {
+          print("⚠ ESP32 disconnected! Will retry scan in 3 seconds...");
+          globalIsBleConnected.value = false;
+          globalAutoStatus.value = "ESP32 Disconnected. Reconnecting...";
+          _connectedDevice = null;
+          Future.delayed(const Duration(seconds: 3), () {
+            if (!globalDemoMode.value) _startBleScan();
+          });
+        }
+      });
+
+      _connectedDevice = device;
+
+      // Wait for connection to stabilise before discovering services
+      await Future.delayed(const Duration(seconds: 2));
+
+      print("Discovering Services...");
+      globalAutoStatus.value = "Connected! Discovering services...";
       List<BluetoothService> services = await device.discoverServices();
+
+      bool foundCharacteristic = false;
       for (var s in services) {
-        if (s.uuid.toString().toLowerCase() == kBleServiceUuid.toLowerCase()) {
+        print("Found Service: ${s.serviceUuid}");
+        if (s.serviceUuid.toString().toLowerCase() ==
+            kBleServiceUuid.toLowerCase()) {
           for (var c in s.characteristics) {
-            if (c.uuid.toString().toLowerCase() ==
-                kBleCharacteristicUuid.toLowerCase()) {
-              _subscribeToCharacteristic(c);
+            print("  Found Characteristic: ${c.characteristicUuid}  "
+                "notify=${c.properties.notify}  read=${c.properties.read}");
+            if (c.characteristicUuid.toString().toLowerCase() ==
+                    kBleCharacteristicUuid.toLowerCase() &&
+                c.properties.notify) {
+              await _subscribeToCharacteristic(c, device);
+              foundCharacteristic = true;
+              print("✅ Successfully subscribed to Pulse Data!");
+              globalIsBleConnected.value = true;
+              globalAutoStatus.value =
+                  "ESP32 Connected & Subscribed! Waiting for heartbeat data...";
             }
           }
         }
       }
+
+      if (!foundCharacteristic) {
+        print("⚠ Connected but could NOT find the pulse characteristic!");
+        print("  Expected service:        $kBleServiceUuid");
+        print("  Expected characteristic: $kBleCharacteristicUuid");
+        globalAutoStatus.value = "Error: Pulse characteristic not found on ESP32!";
+      }
     } catch (e) {
-      debugPrint("BLE Connection error: $e");
       globalIsBleConnected.value = false;
-      globalAutoStatus.value = "Connection failed. Retrying scan...";
+      print("❌ Error during BLE connection: $e");
+      globalAutoStatus.value = "Connection failed: $e. Retrying...";
+      Future.delayed(const Duration(seconds: 3), () => _startBleScan());
     }
   }
 
-  void _subscribeToCharacteristic(BluetoothCharacteristic char) async {
-    await char.setNotifyValue(true);
-    char.lastValueStream.listen((value) {
+  Future<void> _subscribeToCharacteristic(
+      BluetoothCharacteristic char, BluetoothDevice device) async {
+    // CRITICAL: Set up the listener BEFORE enabling notifications
+    final subscription = char.onValueReceived.listen((value) {
       if (value.isNotEmpty) {
+        print('Raw BLE bytes: $value');
         String strVal = String.fromCharCodes(value).trim();
+        print('Decoded string: "$strVal"');
         double? parseBpm = double.tryParse(strVal);
+
+        if (parseBpm == null && value.isNotEmpty) {
+          parseBpm = value.first.toDouble();
+          print('Fallback byte parse: $parseBpm');
+        }
+
         if (parseBpm != null && parseBpm > 40 && parseBpm < 200) {
           globalBPM.value = parseBpm;
+          print('✅ BPM updated: $parseBpm');
         }
       }
     });
+
+    device.cancelWhenDisconnected(subscription);
+
+    // Enable notifications
+    await char.setNotifyValue(true);
+    print("Notifications enabled on ${char.characteristicUuid}");
+
+    // DIAGNOSTIC: Do a manual read right after subscribing to test data flow
+    if (char.properties.read) {
+      try {
+        List<int> readVal = await char.read();
+        print("📖 Manual read value: $readVal");
+        if (readVal.isNotEmpty) {
+          String readStr = String.fromCharCodes(readVal).trim();
+          print("📖 Manual read decoded: \"$readStr\"");
+          double? readBpm = double.tryParse(readStr);
+          if (readBpm != null && readBpm > 40 && readBpm < 200) {
+            globalBPM.value = readBpm;
+            print("✅ BPM from manual read: $readBpm");
+          }
+        } else {
+          print("📖 Manual read returned empty — ESP32 hasn't detected a heartbeat yet.");
+          print("   Check: Is your finger placed firmly on the pulse sensor?");
+          print("   Check: Does ESP32 Serial Monitor show '♥ Heartbeat!' messages?");
+          globalAutoStatus.value =
+              "ESP32 Connected ✓ — Place finger on sensor. Waiting for heartbeat...";
+        }
+      } catch (e) {
+        print("📖 Manual read failed: $e");
+      }
+    }
   }
 
   // Listener for Sleep Detection Logic & Waveform Update
